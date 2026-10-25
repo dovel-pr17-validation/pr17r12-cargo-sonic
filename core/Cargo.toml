@@ -41,7 +41,7 @@ lindera-tokenizer = { optional = true, version = "0.31", default-features = fals
 snowball = { package = "waken_snowball", optional = true, version = "0.1", default-features = false }
 
 [dev-dependencies]
-config = { version = "0.15", default-features = false, features = ["toml"] }
+config = { version = "0.15.26, <0.15.27", default-features = false, features = ["toml"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt"] }
 
 [features]
