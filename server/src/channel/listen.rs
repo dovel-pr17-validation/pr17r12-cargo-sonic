@@ -1,0 +1,98 @@
+// Sonic
+//
+// Fast, lightweight and schema-less search backend
+// Copyright: 2019, Valerian Saliou <valerian@valeriansaliou.name>
+// Copyright: 2026, Rémi Bardon <remi@remibardon.name>
+// License: Mozilla Public License v2.0 (MPL v2.0)
+
+use std::net::TcpListener;
+use std::process;
+use std::sync::{Arc, RwLock};
+use std::thread;
+
+use sonic::executor::DynamicConfigStore;
+use sonic::store::fst::FstStorePool;
+use sonic::store::kv::KvStorePool;
+
+use super::handle::ChannelHandle;
+use crate::THREAD_NAME_CHANNEL_CLIENT;
+
+#[derive(Clone)]
+pub struct ChannelListenBuilder {
+    pub app_conf: Arc<crate::Config>,
+    pub kv_pool: KvStorePool,
+    pub fst_pool: FstStorePool,
+    pub dynamic_conf_store: Arc<DynamicConfigStore>,
+}
+
+pub struct ChannelListen {
+    app_conf: Arc<crate::Config>,
+    kv_pool: KvStorePool,
+    fst_pool: FstStorePool,
+    dynamic_conf_store: Arc<DynamicConfigStore>,
+}
+
+pub static CHANNEL_AVAILABLE: RwLock<bool> = RwLock::new(true);
+
+impl ChannelListenBuilder {
+    pub fn build(&self) -> ChannelListen {
+        ChannelListen {
+            app_conf: Arc::clone(&self.app_conf),
+            kv_pool: self.kv_pool.clone(),
+            fst_pool: self.fst_pool.clone(),
+            dynamic_conf_store: Arc::clone(&self.dynamic_conf_store),
+        }
+    }
+}
+
+impl ChannelListen {
+    pub fn run(&self) {
+        match TcpListener::bind(self.app_conf.channel.inet) {
+            Ok(listener) => {
+                tracing::info!("listening on tcp://{}", self.app_conf.channel.inet);
+
+                for stream in listener.incoming() {
+                    match stream {
+                        Ok(stream) => {
+                            let handle = ChannelHandle {
+                                app_conf: Arc::clone(&self.app_conf),
+                                executor: sonic::Executor::new(
+                                    Arc::clone(&self.app_conf.sonic),
+                                    self.kv_pool.clone(),
+                                    self.fst_pool.clone(),
+                                    Arc::clone(&self.dynamic_conf_store),
+                                ),
+                            };
+
+                            thread::Builder::new()
+                                .name(THREAD_NAME_CHANNEL_CLIENT.to_string())
+                                .spawn(move || {
+                                    if let Ok(peer_addr) = stream.peer_addr() {
+                                        tracing::debug!("channel client connecting: {}", peer_addr);
+                                    }
+
+                                    // Create client
+                                    handle.client(stream);
+                                })
+                                .ok();
+                        }
+                        Err(err) => {
+                            tracing::warn!("error handling stream: {}", err);
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::error!("error binding channel listener: {}", err);
+
+                // Exit Sonic
+                process::exit(1);
+            }
+        }
+    }
+
+    pub fn teardown() {
+        // Channel cannot be used anymore
+        *CHANNEL_AVAILABLE.write().unwrap() = false;
+    }
+}

@@ -1,0 +1,240 @@
+// Sonic
+//
+// Fast, lightweight and schema-less search backend
+// Copyright: 2019, Valerian Saliou <valerian@valeriansaliou.name>
+// Copyright: 2026, Rémi Bardon <remi@remibardon.name>
+// License: Mozilla Public License v2.0 (MPL v2.0)
+
+#![deny(
+    clippy::all,
+    dead_code,
+    unstable_features,
+    unused_imports,
+    unused_qualifications
+)]
+#![warn(
+    clippy::inline_always, // Do not use unless benchmarked (explicit allow).
+)]
+#![allow(
+    clippy::collapsible_if, // Style preference.
+    clippy::explicit_auto_deref, // Style preference.
+    clippy::needless_as_bytes, // Style preference. Better make those things explicit.
+    clippy::needless_borrow, // Style preference.
+    clippy::needless_borrows_for_generic_args, // Style preference.
+)]
+
+mod channel;
+mod config;
+mod logger;
+mod tasker;
+mod util;
+
+use std::str::FromStr;
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
+
+use clap::{Arg, Command};
+
+use channel::listen::{ChannelListen, ChannelListenBuilder};
+use channel::statistics::ensure_states as ensure_states_channel_statistics;
+use sonic::executor::DynamicConfigStore;
+use sonic::store::fst::FstStorePool;
+use sonic::store::kv::KvStorePool;
+use tasker::runtime::TaskerBuilder;
+use tasker::shutdown::ShutdownSignal;
+use tracing::level_filters::LevelFilter;
+
+use crate::config::{Config, read_config};
+use crate::logger::LoggerConfig;
+
+struct AppArgs {
+    config: Option<String>,
+}
+
+#[cfg(unix)]
+#[cfg(feature = "allocator-jemalloc")]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+pub static LINE_FEED: &str = "\r\n";
+
+pub static THREAD_NAME_CHANNEL_MASTER: &str = "sonic-channel-master";
+pub static THREAD_NAME_CHANNEL_CLIENT: &str = "sonic-channel-client";
+pub static THREAD_NAME_TASKER: &str = "sonic-tasker";
+
+const DEFAULT_CONFIG_FILE_PATHS: &[&str] = &[
+    // COMPAT: This has to have a high precedence, for backward compatibility
+    //   with previous default value.
+    "./config.cfg",
+    // COMPAT: This has to have a high precedence, for backward compatibility
+    //   with previous package versions.
+    "/etc/sonic.cfg",
+    "/etc/sonic/config.toml",
+    "/etc/sonic/sonic.cfg.toml",
+    "/etc/sonic/sonic.cfg",
+];
+
+fn make_app_args() -> AppArgs {
+    let matches = Command::new(clap::crate_name!())
+        .version(clap::crate_version!())
+        .author(clap::crate_authors!())
+        .about(clap::crate_description!())
+        .arg(
+            Arg::new("config")
+                .short('c')
+                .long("config")
+                .help("Path to configuration file"),
+        )
+        .get_matches();
+
+    // Generate owned app arguments
+    AppArgs {
+        config: matches.get_one::<String>("config").cloned(),
+    }
+}
+
+fn main() {
+    LoggerConfig::init(
+        std::env::var("SONIC_SERVER__LOG_LEVEL")
+            .map(|level| LevelFilter::from_str(&level).expect("invalid log level"))
+            .unwrap_or(LevelFilter::DEBUG),
+    );
+
+    let app_args = make_app_args();
+
+    let app_conf = read_config(app_args.config.as_deref());
+
+    LoggerConfig::update(
+        LevelFilter::from_str(&app_conf.server.log_level).expect("invalid log level"),
+    );
+
+    // Validate the app configuration.
+    {
+        let invalid_stopwords = (app_conf.sonic.stopwords.allow)
+            .intersection(&app_conf.sonic.stopwords.deny)
+            .collect::<Vec<_>>();
+        if !invalid_stopwords.is_empty() {
+            tracing::error!(invalid = ?invalid_stopwords, "Some stopwords are both allowed and denied. Fix your `stopwords` configuration.");
+            std::process::exit(1);
+        }
+    }
+
+    let shutdown_signal = ShutdownSignal::new();
+
+    tracing::info!("starting up");
+
+    // Ensure all states are bound
+    ensure_states();
+
+    // Create connection pools (does not open any connection yet)
+    let kv_pool = KvStorePool::new(Arc::clone(&app_conf.sonic.store.kv));
+    let fst_pool = FstStorePool::new(Arc::clone(&app_conf.sonic.store.fst), Default::default());
+
+    let dynamic_config = Arc::default();
+
+    // Spawn tasker (background thread)
+    thread::spawn(spawn_tasker(
+        kv_pool.clone(),
+        fst_pool.clone(),
+        Arc::clone(&dynamic_config),
+    ));
+
+    // Spawn channel (foreground thread)
+    thread::spawn(spawn_channel(
+        kv_pool.clone(),
+        fst_pool.clone(),
+        Arc::new(app_conf),
+        dynamic_config,
+    ));
+
+    tracing::info!("started");
+
+    shutdown_signal.at_exit(move |signal| {
+        tracing::info!("stopping gracefully (got signal: {})", signal);
+
+        // Teardown Sonic Channel
+        ChannelListen::teardown();
+
+        // Perform a KV flush (ensures all in-memory changes are synced on-disk before shutdown)
+        kv_pool.flush(true, |_| true);
+
+        // Perform a FST consolidation (ensures all in-memory items are synced on-disk before \
+        //   shutdown; otherwise we would lose all non-consolidated FST changes)
+        fst_pool.consolidate(true, |_| true);
+
+        tracing::info!("stopped");
+    });
+}
+
+fn ensure_states() {
+    // Ensure per-module states
+    ensure_states_channel_statistics();
+}
+
+fn spawn_managed_thread<F, T>(name: &'static str, thread_name: &'static str, task: F)
+where
+    F: Fn() -> T + Clone,
+    F: Send + 'static,
+    T: Send + 'static,
+{
+    tracing::debug!("spawn managed thread: {name}");
+
+    let worker = thread::Builder::new()
+        .name(thread_name.to_string())
+        .spawn(task.clone());
+
+    // Block on worker thread (join it)
+    let has_error = if let Ok(worker_thread) = worker {
+        worker_thread.join().is_err()
+    } else {
+        true
+    };
+
+    if has_error {
+        tracing::error!("managed thread crashed ({name}), setting it up again");
+
+        // Prevents thread start loop floods
+        thread::sleep(Duration::from_secs(1));
+
+        spawn_managed_thread(name, thread_name, task);
+    }
+}
+
+fn spawn_channel(
+    kv_pool: KvStorePool,
+    fst_pool: FstStorePool,
+    app_conf: Arc<Config>,
+    dynamic_conf_store: Arc<DynamicConfigStore>,
+) -> impl FnOnce() {
+    let builder = ChannelListenBuilder {
+        app_conf,
+        kv_pool,
+        fst_pool,
+        dynamic_conf_store,
+    };
+
+    move || {
+        spawn_managed_thread("channel", THREAD_NAME_CHANNEL_MASTER, move || {
+            builder.build().run();
+        })
+    }
+}
+
+fn spawn_tasker(
+    kv_pool: KvStorePool,
+    fst_pool: FstStorePool,
+    dynamic_conf_store: Arc<DynamicConfigStore>,
+) -> impl FnOnce() {
+    let builder = TaskerBuilder {
+        kv_pool,
+        fst_pool,
+        dynamic_conf_store,
+    };
+
+    move || {
+        spawn_managed_thread("tasker", THREAD_NAME_TASKER, move || {
+            builder.build().run();
+        })
+    }
+}
